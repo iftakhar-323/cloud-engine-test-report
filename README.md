@@ -1,140 +1,235 @@
-# Poridhi Cloud-Engine: Test & Bug Audit Summary
+# Cloud Engine - Baremetal & Local Testing Report
 
-> **Target Subsystem:** `cloud-engine` (Compute, Firecracker v1.15.1, OVN & Temporal)  
-> **Environment:** Live 3-Node Baremetal Staging Cluster (`103.174.50.21`, `54.38.94.139`, `51.38.54.39`)  
-> **Status:** Core Data-Plane Operational | 6 Runtime Bugs Audited & Documented  
-
----
-
-## 1. Core Data-Plane Verification (What Works)
-
-### Compute Nodes Readiness (`node-01` & `node-02`)
-- **Status:** Both baremetal compute agents registered and reporting `state: "ready"` with Firecracker v1.15.1.
-- **Proof:** Node agent inspection confirms hypervisor initialization across both physical servers.
-
-![Compute Nodes Ready](./test_evidence/bm_nodes_ready.png)
+Tested on: September 13, 2026  
+Test Setup:
+- Control Plane: `103.174.50.21` (API, Temporal, etcd, MinIO)
+- Compute Node 01: `54.38.94.139` (Firecracker, OVN Controller)
+- Compute Node 02: `51.38.54.39` (Firecracker, OVN Central DB)
 
 ---
 
-### Tenant & VPC Network Provisioning
-- **Status:** Dedicated tenant account created with isolated VPC (`vpc-08aeb8c0`) and Geneve VNI 100.
-- **Proof:** Control-plane assigns unique overlay network parameters and stores state in etcd.
+## 1. Overview
 
-![Tenant Account Created](./test_evidence/bm_account_create.png)
+We ran manual and automated end-to-end tests for `cloud-engine` on both a local development environment and the 3-node baremetal staging cluster.
+
+On baremetal, the core data-plane is working:
+- Firecracker v1.15.1 agents are running on both compute nodes.
+- Ubuntu 22.04 rootfs was built and pulled from MinIO.
+- A guest microVM (`iftakhar-bm-vm1`) successfully booted to `running` state.
+- Network ping into the microVM inside the VPC namespace replied with 0% packet loss and 0.34ms latency.
+
+During the test run, we identified 6 bugs on baremetal and a few edge cases in local testing. The reproducible commands, actual terminal outputs, and screenshots are documented below.
 
 ---
 
-### MicroVM Hardware Virtualization Running
-- **Status:** Real guest microVM booted to `state: "running"` with private IP `10.0.0.1`, TAP `fc-65231f3f`, PID `3869818`.
-- **Proof:** Real Intel Xeon KVM virtualization confirmed on Node-01.
+## 2. Baremetal Verification (Working Features)
+
+### 2.1 Compute Nodes Status
+Both compute nodes (`node-01` and `node-02`) registered with the control plane and reported `state: "ready"` with Firecracker v1.15.1.
+
+```bash
+curl -s http://103.174.50.21:8080/nodes/list | jq .
+```
+
+![Compute Nodes Status](./test_evidence/bm_nodes_ready.png)
+
+---
+
+### 2.2 Account & VPC Creation
+Account creation allocated an isolated VPC (`vpc-08aeb8c0`) and Geneve VNI 100.
+
+```bash
+curl -s -X POST http://103.174.50.21:8080/accounts/create \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"iftakhar-bm-test","email":"iftakhar@poridhi.io"}' | jq .
+```
+
+![Account Creation](./test_evidence/bm_account_create.png)
+
+---
+
+### 2.3 MicroVM Launch and Execution
+The microVM (`iftakhar-bm-vm1`) launched on Node-01 with private IP `10.0.0.1`, tap device `fc-65231f3f`, and host PID `3869818`.
+
+```bash
+curl -s http://103.174.50.21:8080/vms/65231f3faf6a46be929a589c130d777b | jq .
+```
 
 ![MicroVM Running](./test_evidence/bm_vm_running.png)
 
 ---
 
-### MicroVM SSH & Network Namespace Info
-- **Status:** Guest connection metadata mapped into `ns-vpc-vpc-08aeb8c0`.
-- **Proof:** Proxy connection strings and logical port bindings verified.
+### 2.4 SSH Metadata & VPC Namespace
+Connection info shows the microVM mapped into network namespace `ns-vpc-vpc-08aeb8c0`.
 
-![VM SSH Connection Info](./test_evidence/bm_vm_ssh_info.png)
+```bash
+curl -s http://103.174.50.21:8080/vms/65231f3faf6a46be929a589c130d777b/ssh | jq .
+```
+
+![SSH Metadata](./test_evidence/bm_vm_ssh_info.png)
 
 ---
 
-### In-Guest Network Reachability (ICMP Ping)
-- **Status:** Ping across virtual TAP inside VPC namespace: 3 packets transmitted, 3 received, 0% packet loss, 0.34ms round-trip latency.
-- **Proof:** Virtualized network stack between host OVN switch and guest kernel is functional.
+### 2.5 In-Guest Network Ping
+Pinged the microVM from Node-01 inside the VPC namespace across the virtual tap interface. Result: 3 packets transmitted, 3 received, 0% packet loss, 0.34ms round-trip latency.
+
+```bash
+ssh root@54.38.94.139 "ip netns exec ns-vpc-vpc-08aeb8c0 ping -c 3 10.0.0.1"
+```
 
 ![In-Guest Ping Success](./test_evidence/bm_in_guest_ping_success.png)
 
 ---
 
-## 2. Audited Bugs & Direct Screenshot Evidence
+## 3. Bugs Found on Baremetal
 
-### BM-BUG-01: MicroVM Snapshot Fails (Jailer PID Mismatch)
-- **Keyword:** Snapshot Failure | **Severity:** High
-- **Problem:** Captures Jailer launcher PID (`3869818`) instead of child Firecracker daemon PID inside chroot jail.
-- **Result:** `/proc/<pid>/cmdline` verification fails precondition -> Snapshot permanently marked `failed`.
-- **Actionable Fix:** Inspect `/proc/<jailer_pid>/task/` or cgroup process list to record the actual child Firecracker daemon PID upon VM launch.
+### Bug 1: MicroVM snapshot fails with Jailer PID mismatch
+- **What happened:** Taking a snapshot of a running VM fails. The orchestrator activity `CreateSnapshotOnNode` verifies process health by checking `/proc/<pid>/cmdline`. However, the PID stored in etcd (`3869818`) is the parent Jailer wrapper process, not the child Firecracker daemon running inside the chroot jail.
+- **Command run:**
+  ```bash
+  curl -s http://103.174.50.21:8080/vms/65231f3faf6a46be929a589c130d777b/snapshots | jq .
+  ```
+- **Terminal output:**
+  ```json
+  "error": "activity error (type: CreateSnapshotOnNode...): rpc error: code = FailedPrecondition desc = vm 65231f3faf6a46be929a589c130d777b: pid 3869818 is not this VM's firecracker process"
+  ```
+- **Screenshot:**
 
-![BM-BUG-01 Snapshot Precondition Failure Evidence](./test_evidence/bug_bm_01_snapshot_pid_failure.png)
+![Bug 1 - Snapshot Failure](./test_evidence/bug_bm_01_snapshot_pid_failure.png)
 
----
-
-### BM-BUG-02: Blind 202 Accepted on Fake VMs (Phantom Workflows)
-- **Keyword:** Phantom Workflows | **Severity:** Medium
-- **Problem:** Calling restart or terminate on non-existent VM IDs returns `202 Accepted` instead of `404 Not Found`.
-- **Result:** Triggers unnecessary Temporal workflows that consume worker threads and generate false alerts.
-- **Actionable Fix:** Add synchronous `GetVM` existence check in Gin route handlers before starting workflows.
-
-![BM-BUG-02 Blind 202 Accepted Evidence](./test_evidence/bug_bm_02_fake_vm_202_restart.png)
+- **Fix:** In the node agent launcher, resolve the child Firecracker process ID from `/proc/<jailer_pid>/task/` or the cgroup process list before saving it to etcd.
 
 ---
 
-### BM-BUG-03: Unbounded Duplicate Account Creation & VNI Leak
-- **Keyword:** VNI Exhaustion | **Severity:** Medium
-- **Problem:** Submitting identical email repeatedly creates multiple accounts and VPCs.
-- **Result:** Leaks and permanently exhausts unique Geneve VNIs (100–16,777,215).
-- **Actionable Fix:** Maintain an inverted key index `/accounts-by-email/<email>` via atomic etcd CAS transaction.
+### Bug 2: Mutating non-existent VM returns 202 Accepted
+- **What happened:** Sent a restart request with a fake VM ID (`00000000000000000000000000000000`). Instead of returning 404 Not Found, the API responded with 202 Accepted and started a Temporal workflow run.
+- **Command run:**
+  ```bash
+  curl -s -X POST http://103.174.50.21:8080/vms/00000000000000000000000000000000/restart | jq .
+  ```
+- **Terminal output:**
+  ```json
+  {
+    "operation_id": "vm/00000000000000000000000000000000/restart",
+    "run_id": "01a09a8c-6a31-7d8e-b6ac-9b0be550b53f",
+    "state": "restarting",
+    "vm_id": "00000000000000000000000000000000"
+  }
+  ```
+- **Screenshot:**
 
-![BM-BUG-03 Duplicate Account VNI Leak Evidence](./test_evidence/bug_bm_03_duplicate_account_vni_leak.png)
+![Bug 2 - Fake VM 202 Accepted](./test_evidence/bug_bm_02_fake_vm_202_restart.png)
 
----
-
-### BM-BUG-04: API Contract Key Divergence (`account_id` vs `id`)
-- **Keyword:** Contract Divergence | **Severity:** Low
-- **Problem:** `POST /accounts/create` returns `"account_id"`, but `GET /accounts/:id` returns `"id"`.
-- **Result:** Breaks SDKs and clients expecting consistent schema keys.
-- **Actionable Fix:** Standardize response structs to emit both `id` and `account_id`.
-
-![BM-BUG-04 Account ID vs ID Divergence Evidence](./test_evidence/bug_bm_04_account_id_vs_id_divergence.png)
-
----
-
-### BM-BUG-05: REST Route Divergence (404 on Bare Plural Nouns)
-- **Keyword:** Routing 404 | **Severity:** Low
-- **Problem:** `GET /accounts` and `GET /vms` return `404 page not found` (only `/accounts/list` works).
-- **Result:** Breaks standard REST conventions and API gateway reverse proxies.
-- **Actionable Fix:** Add alias route registrations in `handler.go` (`r.GET("/accounts", h.ListAccounts)`).
-
-![BM-BUG-05 Route 404 Divergence Evidence](./test_evidence/bug_bm_05_route_404_divergence.png)
+- **Fix:** In `internal/api/vm_restart.go` and `vm_terminate.go`, add a synchronous `h.store.GetVM(ctx, vmID)` check before executing the Temporal workflow.
 
 ---
 
-### BM-BUG-06: Premature IP & MAC Lease on Invalid Image ID
-- **Keyword:** Premature IP Lease | **Severity:** Medium
-- **Problem:** Requesting a VM with an invalid `image_id` immediately reserves private IP `10.0.0.2` and MAC before failing.
-- **Result:** Wastes IP leases in tenant VPC.
-- **Actionable Fix:** Validate `image_id` against etcd synchronously before calling the IPAM allocator.
+### Bug 3: Duplicate accounts allowed with same email (Geneve VNI leak)
+- **What happened:** Called `POST /accounts/create` twice with the same email (`mytest@example.com`). Both requests succeeded and created two separate accounts (`a23535f2...` and `f15235d1...`), allocating two separate Geneve VNIs (103 and 104).
+- **Command run:**
+  ```bash
+  curl -s -X POST http://103.174.50.21:8080/accounts/create \
+    -H 'Content-Type: application/json' \
+    -d '{"name":"dup-user","email":"mytest@example.com"}' | jq .
+  ```
+- **Screenshot:**
 
-![BM-BUG-06 Premature IP Lease Evidence](./test_evidence/bug_bm_06_invalid_img_premature_ip_lease.png)
+![Bug 3 - Duplicate Account VNI Leak](./test_evidence/bug_bm_03_duplicate_account_vni_leak.png)
 
----
-
-## 3. Local Dev vs Baremetal Boundary
-
-- **Local Laptop:** Control-Plane validation only (`etcd`, `postgres`). `POST /vms/create` returns `503 Orchestrator not configured` (expected because laptop lacks KVM/root TAP privileges).
-- **Baremetal Staging:** Full Data-Plane with real AWS Firecracker microVMs and OVN overlay switching.
-
-![Local E2E Flow Execution](./test_evidence/local_e2e_flow_run.png)
+- **Fix:** Maintain a unique key in etcd at `/accounts-by-email/<email>` using a transaction so subsequent registrations return 409 Conflict.
 
 ---
 
-## 4. Master Bug Action Matrix
+### Bug 4: Field name mismatch between Create and Get account endpoints
+- **What happened:** `POST /accounts/create` returns the field as `"account_id"`, but `GET /accounts/:id` returns it as `"id"`. This causes parsing issues in client SDKs.
+- **Command run:**
+  ```bash
+  curl -s http://103.174.50.21:8080/accounts/08aeb8c08fc8d0526b5cd2390df9ca2c | jq .
+  ```
+- **Terminal output:**
+  ```json
+  {
+    "id": "08aeb8c08fc8d0526b5cd2390df9ca2c",
+    "name": "iftakhar-bm-test",
+    "email": "iftakhar@poridhi.io",
+    "vpc_id": "vpc-08aeb8c0"
+  }
+  ```
+- **Screenshot:**
 
-| Bug Ref | Environment | Severity | Component | Issue Summary | Actionable Patch |
-| :---: | :---: | :---: | :---: | :--- | :--- |
-| **BM-BUG-01** | Baremetal | High | Hypervisor | VM Snapshot fails with Jailer PID mismatch | Track child Firecracker daemon PID instead of Jailer wrapper PID. |
-| **BM-BUG-02** | Baremetal | Medium | API / Temporal | Blind 202 Accepted on non-existent resources | Add synchronous existence check in Gin handlers before dispatching workflows. |
-| **BM-BUG-03** | Baremetal | Medium | Store / IPAM | Unbounded duplicate accounts & VNI leak | Enforce unique email index `/accounts-by-email/<email>` via etcd CAS transaction. |
-| **BM-BUG-04** | Baremetal | Low | Contract | Key divergence (`account_id` on POST vs `id` on GET) | Emit both `id` and `account_id` in response JSON structs. |
-| **BM-BUG-05** | Baremetal | Low | Routing | 404 on standard REST plural nouns | Add alias route registrations in `handler.go` (`/accounts`, `/vms`). |
-| **BM-BUG-06** | Baremetal | Medium | API / IPAM | Premature IP lease on invalid image ID | Validate `image_id` existence prior to reserving VPC private IP. |
-| **LOCAL-BUG-02**| Local / Prod | High | etcd Store | Non-atomic `SetVMState` Read-Modify-Write | Replace `GetVM` -> `PutVM` with etcd CAS ModRevision retry transaction. |
-| **LOCAL-BUG-03**| Local / Prod | High | IPAM / Perf | `AllocateVNI` linear CAS retry loop storm | Implement randomized exponential backoff / cursor chunking. |
-| **LOCAL-BUG-04**| Local / Prod | High | DevOps / CI | Missing `TEMPORAL_PAYLOAD_KEY` in `.env.example` | Document encryption payload key in `.env.example`. |
-| **LOCAL-BUG-05**| Local / Prod | High | CI / Workflow | Missing Temporal replay test suite | Create `replay_test.go` and record history fixtures. |
+![Bug 4 - Account ID Field Mismatch](./test_evidence/bug_bm_04_account_id_vs_id_divergence.png)
+
+- **Fix:** Update the JSON tags or struct in `account_get.go` to emit both `id` and `account_id`.
 
 ---
 
-> Full Technical Reference:  
-> Detailed test procedures, configuration parameters, and RCA logs are preserved in [PORIDHI_LOCAL_AND_BAREMETAL_TESTING_GUIDE_AND_BUG_REPORT.md](./PORIDHI_LOCAL_AND_BAREMETAL_TESTING_GUIDE_AND_BUG_REPORT.md).
+### Bug 5: GET /accounts and GET /vms return 404
+- **What happened:** Standard REST calls `GET /accounts` and `GET /vms` return 404 page not found. The API router only registers `/accounts/list` and `/vms/list`.
+- **Command run:**
+  ```bash
+  curl -s http://103.174.50.21:8080/accounts; echo ''
+  curl -s http://103.174.50.21:8080/vms; echo ''
+  ```
+- **Terminal output:**
+  ```text
+  404 page not found
+  404 page not found
+  ```
+- **Screenshot:**
+
+![Bug 5 - Route 404](./test_evidence/bug_bm_05_route_404_divergence.png)
+
+- **Fix:** In `internal/api/handler.go`, register route aliases for `/accounts` and `/vms`.
+
+---
+
+### Bug 6: Invalid image ID allocates IP and MAC before failing
+- **What happened:** When requesting a VM with a non-existent `image_id` (`img-nonexistent`), the API allocates a private IP (`10.0.0.2`) and MAC address, returning 202 Accepted. The workflow fails asynchronously a moment later and marks the VM as `terminated`, leaving an allocated IP.
+- **Command run:**
+  ```bash
+  curl -s http://103.174.50.21:8080/vms/6f7064dfd0f8a9b6e8f20d947e63b184 | jq .
+  ```
+- **Terminal output:**
+  ```json
+  {
+    "vm_id": "6f7064dfd0f8a9b6e8f20d947e63b184",
+    "image_id": "img-nonexistent",
+    "private_ip": "10.0.0.2",
+    "mac_addr": "6E:70:64:DF:D0:F8",
+    "state": "terminated"
+  }
+  ```
+- **Screenshot:**
+
+![Bug 6 - Premature IP Allocation](./test_evidence/bug_bm_06_invalid_img_premature_ip_lease.png)
+
+- **Fix:** In `vm_create.go`, validate `image_id` against etcd before invoking the IPAM lease allocator.
+
+---
+
+## 4. Local Testing & Boundary Notes
+
+- In the local dev environment, `POST /vms/create` returns `503 Service Unavailable: orchestrator not configured`. This is normal behavior because creating TAP devices and Jailer chroots requires Linux root privileges and `/dev/kvm`, which are only available on the baremetal servers.
+- Local E2E runner execution:
+
+![Local E2E Run](./test_evidence/local_e2e_flow_run.png)
+
+- Concurrent user simulation run (8 parallel users):
+
+![Concurrent Simulation Run](./test_evidence/local_concurrent_sim_run.png)
+
+---
+
+## 5. Summary of Issues
+
+| Ref | Type | Severity | Description | Fix Location |
+| :---: | :---: | :---: | :--- | :--- |
+| **BM-01** | Bug | High | VM snapshot fails due to Jailer wrapper PID tracking | `cloud-engine/internal/agent/orchestrator.go` |
+| **BM-02** | Bug | Medium | Restarting fake VM returns 202 instead of 404 | `cloud-engine/internal/api/vm_restart.go` |
+| **BM-03** | Bug | Medium | Duplicate account creation with same email leaks VNIs | `cloud-engine/internal/store/account.go` |
+| **BM-04** | Bug | Low | Field name mismatch (`account_id` vs `id`) | `cloud-engine/internal/api/account_get.go` |
+| **BM-05** | Bug | Low | Missing standard REST routes `/accounts` and `/vms` | `cloud-engine/internal/api/handler.go` |
+| **BM-06** | Bug | Medium | Invalid image ID reserves private IP before failing | `cloud-engine/internal/api/vm_create.go` |
+| **LOC-01** | Code Review | High | Non-atomic `SetVMState` read-modify-write in etcd | `cloud-engine/internal/store/vm.go:71` |
+| **LOC-02** | Perf | High | Linear CAS retry loop in `AllocateVNI` degrades under concurrency | `cloud-engine/internal/store/ipam.go` |
+| **LOC-03** | Config | High | Missing `TEMPORAL_PAYLOAD_KEY` in `.env.example` | `cloud-engine/.env.example` |
